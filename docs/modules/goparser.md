@@ -69,10 +69,16 @@ most complex stage in the pipeline.
   Parses in `typeOnly` mode to suppress parameter symbol registration.
   Generic functions (`func Name[T any](...)`) are detected here and
   stored as `symbol.Generic` templates instead of being parsed immediately.
-- **`SplitAndSortVarDecls(decls []Tokens) []Tokens`** -- expands
-  `var(...)` blocks into individual declarations and topologically sorts
-  them by dependency (references between var initializers). Non-var
-  declarations keep their original positions.
+- **`expandVarBlocks(decls []Tokens) []Tokens`** -- flattens `var(...)`
+  blocks into individual declarations. Init-order analysis itself
+  lives in the comp layer (see [comp](comp.md#var-init-dependency-analysis)
+  and [ADR-015](../decisions/ADR-015-var-init-dep-analysis-in-comp.md));
+  this helper only normalises the parsed shape.
+- **`WalkIdents(toks Tokens, fn func(name string))`** -- best-effort
+  Ident walker that descends into nested blocks via `scanBlock`.
+  Exported so `comp` can implement its compile-order var-decl topo
+  walk (`varCompileOrder`) without re-implementing block descent.
+  Inner-scan errors are silently skipped.
 - **`recvTypeName(recvr Tokens) string`** -- extracts the type name from
   scanned receiver tokens (e.g. `"T"` from `(t T)`, `"*T"` from
   `(t *T)`).
@@ -245,7 +251,8 @@ Import resolution lives in `import.go`. `ParseAll` is the main entry point:
    Failures with `ErrUndefined` are retried until convergence; rollback is
    lightweight (only `SymTracker` keys are deleted).
 6. Returns the remaining declarations (func bodies, var initializers) after
-   running `SplitAndSortVarDecls`.
+   running `expandVarBlocks`. Var-init ordering happens later in the
+   comp layer (see [ADR-015](../decisions/ADR-015-var-init-dep-analysis-in-comp.md)).
 
 `importSrc` handles `import` statements by calling `ParseAll` recursively
 for the imported package path. It saves/restores both `pkgName` and

@@ -108,8 +108,11 @@ See [vm](modules/vm.md#call-frame) for details.
    (declarations, retry loop, struct placeholders) lives in
    `goparser.ParseAll`; Phase 2 (code generation with pre-allocated data
    slots) lives in `comp.Compile`. Phase 1 uses a retry loop for forward
-   references; Phase 2 uses topological sorting of var declarations to
-   eliminate retries entirely. See [ADR-004](decisions/ADR-004-lazy-fixpoint.md).
+   references; Phase 2 emits var initializers into per-buffer scopes,
+   tracks slot-refs at emit time, then topologically sorts the buffers
+   by their bytecode-derived reads and prepends them to `c.Code`.
+   See [ADR-004](decisions/ADR-004-lazy-fixpoint.md) and
+   [ADR-015](decisions/ADR-015-var-init-dep-analysis-in-comp.md).
 
 5. **Per-type opcodes** -- all arithmetic opcodes are statically typed;
    there are no generic `Add`/`Sub`/`Mul`/`Neg`/`Greater`/`Lower` opcodes.

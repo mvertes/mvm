@@ -45,46 +45,22 @@ func (p *Parser) caseClauses(body Tokens) []Tokens {
 	return out
 }
 
-// splitAndSortVarDecls splits var(...) blocks into individual declarations,
-// topologically sorts them by dependency, and returns the reordered list.
-// Funcs and other statements keep their original relative positions; only
-// var declarations are extracted, sorted, and placed back into var slots.
-func (p *Parser) splitAndSortVarDecls(decls []Tokens) []Tokens {
-	// Expand var blocks and identify var slot positions.
-	type slot struct {
-		pos  int    // position in expanded list
-		decl Tokens // the var declaration
-	}
-	var expanded []Tokens
-	var varSlots []slot
+// expandVarBlocks expands `var (...)` blocks into individual var
+// declarations and returns the resulting slice. Init-order analysis is
+// done later by comp/ from the emitted bytecode (see comp.Compile).
+func (p *Parser) expandVarBlocks(decls []Tokens) []Tokens {
+	var out []Tokens
 	for _, decl := range decls {
 		if len(decl) == 0 {
 			continue
 		}
-		switch decl[0].Tok {
-		case lang.Var:
-			for _, vd := range p.splitVarBlock(decl) {
-				varSlots = append(varSlots, slot{pos: len(expanded), decl: vd})
-				expanded = append(expanded, vd)
-			}
-		default:
-			expanded = append(expanded, decl)
+		if decl[0].Tok == lang.Var {
+			out = append(out, p.splitVarBlock(decl)...)
+		} else {
+			out = append(out, decl)
 		}
 	}
-	if len(varSlots) <= 1 {
-		return expanded
-	}
-
-	// Extract var declarations, sort by dependency, and place back.
-	vars := make([]Tokens, len(varSlots))
-	for i, s := range varSlots {
-		vars[i] = s.decl
-	}
-	vars = p.sortByDeps(vars)
-	for i, s := range varSlots {
-		expanded[s.pos] = vars[i]
-	}
-	return expanded
+	return out
 }
 
 func (p *Parser) varLines(toks Tokens) ([]Tokens, error) {
@@ -118,74 +94,6 @@ func (p *Parser) splitVarBlock(decl Tokens) []Tokens {
 		}
 	}
 	return result
-}
-
-func (p *Parser) sortByDeps(decls []Tokens) []Tokens {
-	if len(decls) <= 1 {
-		return decls
-	}
-	nameSet := map[string]int{}
-	for i, decl := range decls {
-		if len(decl) >= 2 && decl[1].Tok == lang.Ident {
-			nameSet[decl[1].Str] = i
-		}
-	}
-	if len(nameSet) == 0 {
-		return decls
-	}
-
-	n := len(decls)
-	rdeps := make([][]int, n)
-	inDeg := make([]int, n)
-	for i, decl := range decls {
-		seen := map[int]bool{}
-		rhs := decl[1:] // skip "var" keyword
-		if j := rhs.Index(lang.Assign); j >= 0 {
-			rhs = rhs[j+1:]
-		}
-		p.collectIdents(rhs, nameSet, seen)
-		for dep := range seen {
-			rdeps[dep] = append(rdeps[dep], i)
-			inDeg[i]++
-		}
-	}
-
-	queue := make([]int, 0, n)
-	for i, d := range inDeg {
-		if d == 0 {
-			queue = append(queue, i)
-		}
-	}
-	result := make([]Tokens, 0, n)
-	for head := 0; head < len(queue); head++ {
-		i := queue[head]
-		result = append(result, decls[i])
-		for _, j := range rdeps[i] {
-			if inDeg[j]--; inDeg[j] == 0 {
-				queue = append(queue, j)
-			}
-		}
-	}
-	for i, d := range inDeg {
-		if d > 0 {
-			result = append(result, decls[i])
-		}
-	}
-	return result
-}
-
-func (p *Parser) collectIdents(toks Tokens, nameSet map[string]int, out map[int]bool) {
-	for _, t := range toks {
-		if t.Tok == lang.Ident {
-			if dep, ok := nameSet[t.Str]; ok {
-				out[dep] = true
-			}
-		} else if t.Tok.IsBlock() {
-			if inner, err := p.scanBlock(t.Token, false); err == nil {
-				p.collectIdents(inner, nameSet, out)
-			}
-		}
-	}
 }
 
 func (p *Parser) parseVarDecl(toks Tokens) (handled bool, err error) {

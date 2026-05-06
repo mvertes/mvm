@@ -15,13 +15,19 @@ slice and populates a `Data` slice (the global memory segment).
 - **`Compiler`** -- embeds `*goparser.Parser`. Manages `Code`, `Data`,
   `Entry` (start IP), string deduplication (`strings` map), method ID
   allocation (`methodIDs` map), and a type-pointer dedup cache
-  (`typeIdxs`). Position resolution rides on the embedded Parser's
-  `Sources` registry and `PosBase`; tokens carry absolute positions.
-- **`Compile(name, src string) error`** -- end-to-end compilation. Delegates
-  Phase 1 (declaration resolution with retry loop) to `ParseAll`, then runs
-  `allocGlobalSlots` and Phase 2 code generation (var initializers first,
-  then func bodies). `name` identifies the source (`"m:<content>"` for
-  inline, `"f:<path>"` for file).
+  (`typeIdxs`). Holds an `emitReads []*map[int]bool` scope stack used
+  for var-init dep analysis (see below). Position resolution rides on
+  the embedded Parser's `Sources` registry and `PosBase`; tokens
+  carry absolute positions.
+- **`Compile(name, src string) error`** -- end-to-end compilation.
+  Delegates Phase 1 (declaration resolution with retry loop) to
+  `ParseAll`, then runs `allocGlobalSlots` and Phase 2 code
+  generation. Var initializers compile into per-buffer scopes, then
+  func bodies and top-level statements compile in source order, then
+  the var buffers are topo-sorted by their bytecode-derived reads and
+  prepended to `c.Code` (see [Var-init dependency analysis](#var-init-dependency-analysis)).
+  `name` identifies the source (`"m:<content>"` for inline,
+  `"f:<path>"` for file).
 - **`Dump() / ApplyDump(d)`** -- snapshot and restore global variable
   state (used for REPL resets).
 - **`c.errAt(t, format, args...)`** -- builds an error formatted from
@@ -210,17 +216,15 @@ directly:
    into top-level declarations, pre-registers struct type placeholders,
    and runs a retry loop passing each declaration to `ParseDecl`. Returns
    the remaining declarations (func bodies, var initializers) after
-   topological sorting. See [goparser](goparser.md#package-and-import-handling)
-   for details.
+   `expandVarBlocks` flattens `var(...)` blocks. See
+   [goparser](goparser.md#package-and-import-handling) for details.
 
 2. **Phase 2 -- Code generation** (in `Compile`). `allocGlobalSlots`
-   pre-assigns data indices for every `Var` and `Func` symbol. Code is
-   then generated in two passes:
-   - **Pass 1:** var initializers, so all global var types are concrete.
-   - **Pass 2:** func bodies and expression statements.
-
-   Because all symbols have allocated slots, Phase 2 needs no retries or
-   rollback machinery.
+   pre-assigns data indices for every `Var` and `Func` symbol, then
+   each var initializer compiles into its own bytecode buffer, then
+   func bodies and top-level statements compile into `c.Code`, then
+   the buffers are topologically sorted and prepended (see next
+   section).
 
 #### allocGlobalSlots
 
@@ -230,6 +234,83 @@ assigns a `Data` slot to each, appending the symbol's `Value` (or a
 `NewValue` zero for uninitialized vars). Type and Value symbols are still
 allocated lazily in the `Ident` handler, since many built-in types may
 never be referenced.
+
+### Var-init dependency analysis
+
+mvm honours Go's package-init rule (a var depends on every var read by
+its initializer, transitively through function calls). The analysis
+runs entirely at the comp layer using the compiler's own emitted
+bytecode as the source of truth. See
+[ADR-015](../decisions/ADR-015-var-init-dep-analysis-in-comp.md) for
+the design rationale.
+
+The output layout per `Compile` call (when var-inits are present) is:
+
+```
+[var-init buffers in topo order] [func bodies] [top-level statements]
+```
+
+Var-inits sit at the front so linear execution runs them before any
+top-level statement that might reference a package var. Func bodies
+have their own per-func skip-jumps emitted by `goparser`, so they're
+bypassed by linear flow when not called.
+
+The compile flow:
+
+1. **Compile-order pre-walk (`varCompileOrder`).** A token-level
+   sibling-Ident topo over `varDecls` using `goparser.WalkIdents`. A
+   var whose RHS Ident-references another sibling must compile after
+   it so RHS type inference sees the dep's already-set `Type`. Direct
+   refs only -- transitive function-body reads are not followed here;
+   that is the runtime topo's job.
+
+2. **Per-buffer compile.** Each var-init runs `compileDecl` with
+   `c.Code` swapped to nil and a fresh `&vb.reads` pushed onto
+   `c.emitReads`. Inline `var f = func(){...}` literals registered
+   during the buffer's compile are tracked on `vb.funcSyms` so their
+   buffer-relative entry-points can later be shifted by the buffer's
+   offset within the prefix.
+
+3. **Rest compile.** Func bodies and top-level statements compile in
+   source order into `c.Code`. Each Func body pushes/pops `&s.Reads`
+   on `c.emitReads` via the `lang.Label` and `<name>_end` handlers in
+   `generate`.
+
+4. **Fixed-point expansion (`expandReads`).** The emit-time
+   accumulators contain a mix of Var and Func slot indices. The
+   expansion pass swaps each accumulator with a fresh empty map (so
+   the loop reads from an immutable snapshot while writing) and
+   converges to transitive Var-only sets by unioning callee Func
+   `Reads` into caller. Self-recursion is skipped to avoid map
+   iter-while-mutate.
+
+5. **Topo sort + prepend.** `topoSortVarBufs` orders the buffers by
+   slot deps (`varBuf.produces` from LHS Ident lookup vs `vb.reads`
+   from emit-time tracking). The sorted prefix is built into a fresh
+   `vm.Code` slice with capacity `prefixLen + len(c.Code)`, the old
+   `c.Code` is appended, and every Func symbol's entry-point is
+   shifted by the prefix length (or by its owning buffer's offset for
+   inline-literal Funcs). Aliasing imports (one `*Symbol` under
+   multiple keys) are deduped via a pointer-keyed set.
+
+`varCompileOrder` and `topoSortVarBufs` share `kahnTopoSort`. The
+bytecode emit hook lives in `c.emit()`:
+
+```go
+if isSlotRefOp(op) && len(c.emitReads) > 0 && len(arg) > 0 {
+    addSlot(c.emitReads[len(c.emitReads)-1], arg[0])
+}
+```
+
+`isSlotRefOp` matches `vm.GetGlobal`, `vm.CallImm`, `vm.GoCallImm`. The
+hook adds a single slice-len check on the emit hot path; the recording
+branch only fires for those three opcodes.
+
+**Limitations.** Interface method dispatch through a runtime vtable
+and function values fetched from runtime containers (`m["x"]()`)
+remain opaque -- the bytecode does not expose a callee slot for them.
+This was a limit of the previous parser-side analysis too, so no
+regression.
 
 ### Variadic call-site packing
 

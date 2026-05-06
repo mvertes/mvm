@@ -237,7 +237,7 @@ func (p *Parser) ParseAll(name, src string) (out []Tokens, err error) {
 	// Pass 1 compiles var initializers so that all var types are resolved.
 	// Pass 2 compiles func bodies and expression statements; by then every
 	// global var has a concrete type, eliminating forward-reference retries.
-	remaining = p.splitAndSortVarDecls(remaining)
+	remaining = p.expandVarBlocks(remaining)
 	return remaining, err
 }
 

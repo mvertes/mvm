@@ -157,6 +157,22 @@ func (p *Parser) scanBlock(bt scan.Token, endSemi bool) (Tokens, error) {
 	return p.scanAt(bt.Pos+bt.Beg, bt.Block(), endSemi)
 }
 
+// WalkIdents calls fn for every Ident in toks, descending into any nested
+// blocks. Inner scan errors are silently skipped; this is a best-effort
+// walker for free-form symbol collection.
+func (p *Parser) WalkIdents(toks Tokens, fn func(name string)) {
+	for _, t := range toks {
+		switch {
+		case t.Tok == lang.Ident:
+			fn(t.Str)
+		case t.Tok.IsBlock():
+			if inner, err := p.scanBlock(t.Token, false); err == nil {
+				p.WalkIdents(inner, fn)
+			}
+		}
+	}
+}
+
 func (p *Parser) parseTokBlock(bt scan.Token) (Tokens, error) {
 	return p.parseAt(bt.Pos+bt.Beg, bt.Block())
 }

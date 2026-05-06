@@ -29,6 +29,13 @@ to resolve addresses and types.
   - `Data any` -- opaque payload. Used by `Generic` symbols to store a
     `*genericTemplate` (type params, raw token stream, func-or-type flag).
     Nil for all other kinds.
+  - `Reads map[int]bool` -- for `Func` symbols only: the set of global
+    Data-slot indices the function body reads transitively. Populated
+    in two stages by the compiler -- emit-time tracking captures
+    direct slot references as `c.emit()` runs; a fixed-point pass
+    afterwards expands callee Func entries into their transitive Var
+    slots. Used by `comp` to topo-sort var-init buffers
+    (see [ADR-015](../decisions/ADR-015-var-init-dep-analysis-in-comp.md)).
 - **`Kind`** (int enum) -- symbol classification.
 - **`Get(name, scope string) (*Symbol, string, bool)`** -- lookup by
   walking from the innermost scope outward.

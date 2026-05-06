@@ -8,6 +8,7 @@ import (
 	"path"
 	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -38,6 +39,9 @@ type Compiler struct {
 	methodIDs map[string]int                  // global method ID by method name
 	typeIdxs  map[*vm.Type]int                // dedup cache for typeIndex, keyed by mvm type pointer
 	typeSyms  map[reflect.Type]*symbol.Symbol // dedup cache for typeSym, keyed by reflect.Type
+
+	// emitReads is the active scope stack; emit() records slot-refs into the top.
+	emitReads []*map[int]bool
 }
 
 // NewCompiler returns a new compiler state for a given scanner.
@@ -52,30 +56,389 @@ func NewCompiler(spec *lang.Spec) *Compiler {
 	}
 }
 
-// Compile parses src and generates code and data, or returns a non-nil error.
-// Code and data are added incrementally in c.Code and C.Data.
+// Compile parses src and generates code and data. Var-inits are buffered,
+// topo-sorted by their bytecode-derived slot reads, and prepended to
+// c.Code; Func entry-points are shifted by the prefix length.
 func (c *Compiler) Compile(name, src string) error {
 	remaining, err := c.ParseAll(name, src)
 	if err != nil {
 		return err
 	}
 	c.allocGlobalSlots()
-	var rest []goparser.Tokens
+	var varDecls, restDecls []goparser.Tokens
 	for _, decl := range remaining {
-		if len(decl) > 0 && decl[0].Tok == lang.Var {
-			if err := c.compileDecl(decl); err != nil {
-				return err
-			}
+		if len(decl) == 0 {
+			continue
+		}
+		if decl[0].Tok == lang.Var {
+			varDecls = append(varDecls, decl)
 		} else {
-			rest = append(rest, decl)
+			restDecls = append(restDecls, decl)
 		}
 	}
-	for _, decl := range rest {
+
+	compileOrder, err := c.varCompileOrder(varDecls)
+	if err != nil {
+		return err
+	}
+
+	var varBufs []*varBuf
+	if len(varDecls) > 0 {
+		varBufs = make([]*varBuf, 0, len(varDecls))
+		saved := c.Code
+		// priorFuncs: running set of Func symbols already emitted; the
+		// per-iteration delta below is the inline-literals introduced by
+		// this var-init.
+		priorFuncs := funcSymsWithCode(c.Symbols)
+		for _, idx := range compileOrder {
+			c.Code = nil
+			vb := &varBuf{
+				srcPos:   idx,
+				produces: c.varDeclSlots(varDecls[idx]),
+				funcSyms: map[*symbol.Symbol]bool{},
+			}
+			c.emitReads = append(c.emitReads, &vb.reads)
+			err := c.compileDecl(varDecls[idx])
+			c.emitReads = c.emitReads[:len(c.emitReads)-1]
+			if err != nil {
+				c.Code = saved
+				return err
+			}
+			vb.buf = c.Code
+			for _, s := range c.Symbols {
+				if s.Kind == symbol.Func && s.Value.IsValid() && s.Index != symbol.UnsetAddr && !priorFuncs[s] {
+					vb.funcSyms[s] = true
+					priorFuncs[s] = true
+				}
+			}
+			varBufs = append(varBufs, vb)
+			c.Code = saved
+		}
+	}
+
+	for _, decl := range restDecls {
 		if err := c.compileDecl(decl); err != nil {
 			return err
 		}
 	}
+	if len(varBufs) == 0 {
+		return nil
+	}
+
+	c.expandReads(varBufs)
+	sorted := topoSortVarBufs(varBufs)
+
+	type bufLoc struct {
+		offset int
+		funcs  map[*symbol.Symbol]bool
+	}
+	bufLocs := make([]bufLoc, 0, len(sorted))
+	prefixLen := 0
+	for _, vb := range sorted {
+		bufLocs = append(bufLocs, bufLoc{offset: prefixLen, funcs: vb.funcSyms})
+		prefixLen += len(vb.buf)
+	}
+	if prefixLen == 0 {
+		return nil
+	}
+	merged := make(vm.Code, 0, prefixLen+len(c.Code))
+	for _, vb := range sorted {
+		merged = append(merged, vb.buf...)
+	}
+	merged = append(merged, c.Code...)
+	c.Code = merged
+	shifted := map[*symbol.Symbol]bool{}
+	for _, bl := range bufLocs {
+		for f := range bl.funcs {
+			c.shiftFuncEntry(f, bl.offset, shifted)
+		}
+	}
+	for _, s := range c.Symbols {
+		c.shiftFuncEntry(s, prefixLen, shifted)
+	}
 	return nil
+}
+
+// funcSymsWithCode returns Funcs whose entry-point has been emitted.
+func funcSymsWithCode(sm symbol.SymMap) map[*symbol.Symbol]bool {
+	out := map[*symbol.Symbol]bool{}
+	for _, s := range sm {
+		if s.Kind == symbol.Func && s.Value.IsValid() && s.Index != symbol.UnsetAddr {
+			out[s] = true
+		}
+	}
+	return out
+}
+
+// shiftFuncEntry moves a Func symbol's entry-point by `by`. The shifted
+// set dedupes aliased imports (same *Symbol under multiple keys).
+func (c *Compiler) shiftFuncEntry(s *symbol.Symbol, by int, shifted map[*symbol.Symbol]bool) {
+	if shifted[s] {
+		return
+	}
+	shifted[s] = true
+	if s.Kind != symbol.Func || !s.Value.IsValid() || s.Index == symbol.UnsetAddr {
+		return
+	}
+	c.setFuncEntry(s, int(s.Value.Int())+by)
+}
+
+// setFuncEntry stores addr as the entry-point both on s.Value and in
+// c.Data[s.Index].
+func (c *Compiler) setFuncEntry(s *symbol.Symbol, addr int) {
+	s.Value = vm.ValueOf(addr)
+	if s.Index >= 0 && s.Index < len(c.Data) {
+		c.Data[s.Index] = s.Value
+	}
+}
+
+// isSlotRefOp reports whether op encodes a global Data slot in A that
+// counts as a read for var-init dependency analysis.
+func isSlotRefOp(op vm.Op) bool {
+	return op == vm.GetGlobal || op == vm.CallImm || op == vm.GoCallImm
+}
+
+// slotToSymMap reverses c.Data slot index to symbol, restricted to Var
+// and Func — Label symbols default Index to 0 without claiming a slot
+// and would shadow the real slot-0 entry.
+func (c *Compiler) slotToSymMap() map[int]*symbol.Symbol {
+	m := map[int]*symbol.Symbol{}
+	for _, s := range c.Symbols {
+		if s.Kind != symbol.Var && s.Kind != symbol.Func {
+			continue
+		}
+		if s.Index < 0 || s.Index == symbol.UnsetAddr {
+			continue
+		}
+		m[s.Index] = s
+	}
+	return m
+}
+
+// varDeclSlots returns the slot indices written by `var X, Y = ...`.
+// Only inits (decl with `=`) are considered — var-decls without init
+// don't appear in remaining and so don't get a buffer.
+func (c *Compiler) varDeclSlots(decl goparser.Tokens) []int {
+	if len(decl) < 2 {
+		return nil
+	}
+	k := decl.Index(lang.Assign)
+	if k < 0 {
+		return nil
+	}
+	var out []int
+	for _, t := range decl[1:k] {
+		if t.Tok != lang.Ident {
+			continue
+		}
+		s, ok := c.Symbols[t.Str]
+		if !ok || s.Index < 0 || s.Index == symbol.UnsetAddr {
+			continue
+		}
+		out = append(out, s.Index)
+	}
+	return out
+}
+
+// expandReads runs a fixed-point over emit-time direct refs (Var + Func
+// slot indices) to convert each accumulator into a transitive Var-only
+// set. The original direct refs are swapped onto the accum so the loop
+// reads from an immutable snapshot while mutating the output map.
+func (c *Compiler) expandReads(varBufs []*varBuf) {
+	type accum struct {
+		direct map[int]bool
+		out    *map[int]bool
+		owner  *symbol.Symbol
+	}
+	slotToSym := c.slotToSymMap()
+	collected := map[*symbol.Symbol]bool{}
+	var accums []*accum
+	for _, s := range c.Symbols {
+		if collected[s] || s.Kind != symbol.Func || s.Reads == nil {
+			continue
+		}
+		collected[s] = true
+		direct := s.Reads
+		s.Reads = map[int]bool{}
+		accums = append(accums, &accum{direct: direct, out: &s.Reads, owner: s})
+	}
+	for _, vb := range varBufs {
+		direct := vb.reads
+		vb.reads = map[int]bool{}
+		accums = append(accums, &accum{direct: direct, out: &vb.reads})
+	}
+	for {
+		changed := false
+		for _, a := range accums {
+			for slot := range a.direct {
+				sym, ok := slotToSym[slot]
+				if !ok {
+					continue
+				}
+				if sym.Kind == symbol.Var {
+					if addSlot(a.out, slot) {
+						changed = true
+					}
+					continue
+				}
+				if sym.Kind == symbol.Func && sym != a.owner {
+					if unionInto(a.out, sym.Reads) {
+						changed = true
+					}
+				}
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+}
+
+// addSlot adds slot to *dst, allocating dst on first use. Returns true
+// if dst grew.
+func addSlot(dst *map[int]bool, slot int) bool {
+	if *dst == nil {
+		*dst = map[int]bool{}
+	}
+	if (*dst)[slot] {
+		return false
+	}
+	(*dst)[slot] = true
+	return true
+}
+
+// unionInto unions src into *dst. Returns true if dst grew.
+func unionInto(dst *map[int]bool, src map[int]bool) bool {
+	grew := false
+	for s := range src {
+		if addSlot(dst, s) {
+			grew = true
+		}
+	}
+	return grew
+}
+
+// varBuf carries one var-init's emitted bytecode and dep info. funcSyms
+// is the inline-literal Func symbols introduced by this buffer's compile;
+// they shift by the buffer's offset, not the full prefix length.
+type varBuf struct {
+	srcPos   int
+	buf      vm.Code
+	produces []int
+	reads    map[int]bool
+	funcSyms map[*symbol.Symbol]bool
+}
+
+// kahnTopoSort returns a topological ordering of [0, n) given reverse
+// adjacency rev and (mutated) in-degree inDeg. Ties break by lower index;
+// unbroken cycles append at the tail in index order.
+func kahnTopoSort(n int, rev [][]int, inDeg []int) []int {
+	queue := make([]int, 0, n)
+	for i := 0; i < n; i++ {
+		if inDeg[i] == 0 {
+			queue = append(queue, i)
+		}
+	}
+	out := make([]int, 0, n)
+	for head := 0; head < len(queue); head++ {
+		i := queue[head]
+		out = append(out, i)
+		var ready []int
+		for _, j := range rev[i] {
+			if inDeg[j]--; inDeg[j] == 0 {
+				ready = append(ready, j)
+			}
+		}
+		sort.Ints(ready)
+		queue = append(queue, ready...)
+	}
+	for i, d := range inDeg {
+		if d > 0 {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// varCompileOrder orders var-decl indices so any decl whose RHS Ident-
+// references a sibling var compiles after it — required so RHS type
+// inference can see the dep's already-set Type. Transitive function-body
+// reads are out of scope here; runtime ordering is handled separately.
+func (c *Compiler) varCompileOrder(varDecls []goparser.Tokens) ([]int, error) {
+	n := len(varDecls)
+	if n <= 1 {
+		out := make([]int, n)
+		for i := range out {
+			out[i] = i
+		}
+		return out, nil
+	}
+	name2idx := map[string]int{}
+	for i, d := range varDecls {
+		lhs := d[1:]
+		if k := lhs.Index(lang.Assign); k >= 0 {
+			lhs = lhs[:k]
+		}
+		for _, t := range lhs {
+			if t.Tok == lang.Ident {
+				name2idx[t.Str] = i
+			}
+		}
+	}
+	rev := make([][]int, n)
+	inDeg := make([]int, n)
+	for i, d := range varDecls {
+		k := d.Index(lang.Assign)
+		if k < 0 {
+			continue
+		}
+		seen := map[int]bool{}
+		c.WalkIdents(d[k+1:], func(name string) {
+			j, ok := name2idx[name]
+			if !ok || j == i || seen[j] {
+				return
+			}
+			seen[j] = true
+			rev[j] = append(rev[j], i)
+			inDeg[i]++
+		})
+	}
+	return kahnTopoSort(n, rev, inDeg), nil
+}
+
+// topoSortVarBufs orders var-init buffers so any buffer producing a slot
+// another buffer reads is emitted first. Cycles fall back to source order.
+func topoSortVarBufs(bufs []*varBuf) []*varBuf {
+	n := len(bufs)
+	if n <= 1 {
+		return bufs
+	}
+	owner := map[int]int{}
+	for i, vb := range bufs {
+		for _, slot := range vb.produces {
+			owner[slot] = i
+		}
+	}
+	rev := make([][]int, n)
+	inDeg := make([]int, n)
+	for i, vb := range bufs {
+		seen := map[int]bool{}
+		for slot := range vb.reads {
+			j, ok := owner[slot]
+			if !ok || j == i || seen[j] {
+				continue
+			}
+			seen[j] = true
+			rev[j] = append(rev[j], i)
+			inDeg[i]++
+		}
+	}
+	order := kahnTopoSort(n, rev, inDeg)
+	out := make([]*varBuf, len(order))
+	for i, j := range order {
+		out[i] = bufs[j]
+	}
+	return out
 }
 
 func (c *Compiler) compileDecl(decl goparser.Tokens) error {
@@ -304,6 +667,9 @@ func (c *Compiler) emit(t goparser.Token, op vm.Op, arg ...int) {
 		}
 	}
 	c.Code = append(c.Code, inst)
+	if isSlotRefOp(op) && len(c.emitReads) > 0 && len(arg) > 0 {
+		addSlot(c.emitReads[len(c.emitReads)-1], arg[0])
+	}
 }
 
 func (c *Compiler) emitField(t goparser.Token, path []int) {
@@ -1376,6 +1742,7 @@ func (c *Compiler) generate(tokens goparser.Tokens) (err error) {
 					}
 					flen = append(flen, len(stack))
 					funcStack = append(funcStack, t.Str)
+					c.emitReads = append(c.emitReads, &s.Reads)
 					// Register method in its receiver type's method table.
 					if parts := strings.SplitN(t.Str, ".", 2); len(parts) == 2 {
 						typeName := strings.TrimPrefix(parts[0], "*")
@@ -1410,6 +1777,7 @@ func (c *Compiler) generate(tokens goparser.Tokens) (err error) {
 						l := popflen()
 						stack = stack[:l]
 						funcStack = funcStack[:len(funcStack)-1]
+						c.emitReads = c.emitReads[:len(c.emitReads)-1]
 					}
 				}
 				c.SymSet(t.Str, &symbol.Symbol{Kind: symbol.Label, Value: vm.ValueOf(lc)})

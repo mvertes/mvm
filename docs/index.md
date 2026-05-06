@@ -35,3 +35,4 @@ Mvm is an experimental Go interpreter built from a pipeline of composable packag
 - [ADR-012: Package patchers and argument proxies](decisions/ADR-012-package-patchers-arg-proxies.md)
 - [ADR-013: Split stdlib bindings into `core` and `ext`](decisions/ADR-013-stdlib-core-ext-split.md)
 - [ADR-014: Dynamic network imports via Go module proxy](decisions/ADR-014-dynamic-network-imports.md)
+- [ADR-015: Var-init dependency analysis at the comp layer](decisions/ADR-015-var-init-dep-analysis-in-comp.md)
